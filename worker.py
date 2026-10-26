@@ -20,6 +20,8 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
+import time
 
 ENV_PATH = os.environ.get("HOOKCUT_ENV_FILE", "")
 BUCKET = "hookcut"
@@ -113,33 +115,70 @@ def probe_duration(path):
     return float(out.strip())
 
 
+STALL_SECONDS = 120
+
+
+class StallError(RuntimeError):
+    """ffmpeg produced no progress output for STALL_SECONDS: it is wedged
+    (classically on an inherited stdin, or a starved host). Raised so the
+    job can be requeued instead of freezing the progress bar forever."""
+
+
 def run_ffmpeg_progress(cmd, total_seconds, lo, hi, jid, stage):
     """Run ffmpeg with -progress on stdout; map out_time to [lo, hi].
     stderr goes to a temp file so filter messages (silencedetect) and
-    error tails stay readable. Returns the stderr text."""
+    error tails stay readable. Returns the stderr text.
+
+    Two anti-freeze guards (2026-10-25: a cut sat at 42% forever):
+    -nostdin + stdin DEVNULL so ffmpeg can never block reading commands,
+    and a watchdog thread that kills ffmpeg if it emits no progress line
+    for STALL_SECONDS, turning a silent wedge into a retryable StallError."""
+    import threading
+    import time
     err_file = tempfile.NamedTemporaryFile(
         mode="w+", suffix=".log", delete=False, dir=os.environ.get("HOOKCUT_WORKDIR", "/tmp"))
     err_path = err_file.name
-    full = cmd[:1] + ["-progress", "pipe:1", "-nostats"] + cmd[1:]
+    full = cmd[:1] + ["-nostdin", "-progress", "pipe:1", "-nostats"] + cmd[1:]
     proc = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=err_file,
-                            text=True, bufsize=1)
+                            stdin=subprocess.DEVNULL, text=True, bufsize=1)
+    state = {"last": time.monotonic(), "stop": False, "stalled": False}
+
+    def watchdog():
+        while not state["stop"]:
+            if time.monotonic() - state["last"] > STALL_SECONDS:
+                state["stalled"] = True
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            time.sleep(5)
+
+    threading.Thread(target=watchdog, daemon=True).start()
     last_pct = -1
-    for line in proc.stdout:
-        line = line.strip()
-        if line.startswith("out_time_ms=") and total_seconds > 0:
-            try:
-                t = int(line.split("=", 1)[1]) / 1_000_000.0
-            except ValueError:
-                continue
-            pct = lo + (hi - lo) * min(1.0, t / total_seconds)
-            if int(pct) != last_pct:
-                last_pct = int(pct)
-                set_progress(jid, pct, stage)
+    try:
+        for line in proc.stdout:
+            state["last"] = time.monotonic()
+            line = line.strip()
+            if line.startswith("out_time_ms=") and total_seconds > 0:
+                try:
+                    t = int(line.split("=", 1)[1]) / 1_000_000.0
+                except ValueError:
+                    continue
+                pct = lo + (hi - lo) * min(1.0, t / total_seconds)
+                if int(pct) != last_pct:
+                    last_pct = int(pct)
+                    set_progress(jid, pct, stage)
+    finally:
+        state["stop"] = True
     proc.wait()
     err_file.close()
     with open(err_path) as f:
         err_text = f.read()
     os.unlink(err_path)
+    if state["stalled"]:
+        raise StallError(
+            f"encoder stalled: no progress for {STALL_SECONDS}s during {stage}")
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {err_text[-400:]}")
     return err_text
@@ -247,10 +286,22 @@ def process(job):
             "cuts": ncuts, "finished_at": "now()"})
         print(f"job {jid}: {dur:.1f}s -> {out_dur:.1f}s, {ncuts} silences removed")
     except Exception as e:  # noqa: BLE001
-        rest("PATCH", f"hookcut_jobs?id=eq.{jid}", {
-            "status": "failed", "error": str(e)[:500], "stage": "error",
-            "finished_at": "now()"})
-        print(f"job {jid} ERROR: {e}")
+        msg = str(e)[:500]
+        fatal = ("2 GB limit" in msg) or ("15-minute limit" in msg)
+        attempts = (job.get("attempts") or 0) + 1
+        if not fatal and attempts < MAX_ATTEMPTS:
+            # Transient failure (stall, host hiccup): put the job back in
+            # the queue instead of failing it. The bar resets honestly and
+            # the next pass retries; reclaim semantics, but immediate.
+            rest("PATCH", f"hookcut_jobs?id=eq.{jid}", {
+                "status": "queued", "attempts": attempts, "progress": 0,
+                "stage": "queued", "error": None, "started_at": None})
+            print(f"job {jid} retry {attempts}: {e}")
+        else:
+            rest("PATCH", f"hookcut_jobs?id=eq.{jid}", {
+                "status": "failed", "error": msg, "stage": "error",
+                "finished_at": "now()"})
+            print(f"job {jid} ERROR: {e}")
     finally:
         subprocess.run(["rm", "-rf", tmp])
 
@@ -292,7 +343,7 @@ def cleanup_expired():
         print(f"cleanup: media expired for job {row['id']}")
 
 
-STALE_MINUTES = 12
+STALE_MINUTES = 5
 MAX_ATTEMPTS = 3
 
 
