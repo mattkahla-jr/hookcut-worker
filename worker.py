@@ -83,16 +83,27 @@ def set_progress(jid, pct, stage):
 
 
 def download(path, dest):
-    data = sb_req("GET", f"/storage/v1/object/{BUCKET}/{path}", raw=True)
-    with open(dest, "wb") as f:
-        f.write(data)
+    # Stream straight to disk: loading a multi-hundred-MB source into
+    # Python memory first contributed to worker OOM kills (Oct 25, 2026:
+    # a 151 MB 4K upload killed the host twice mid-render).
+    cmd = ["curl", "-s", "-f", "-o", dest,
+           f"{SB_URL}/storage/v1/object/{BUCKET}/{path}",
+           "-H", f"apikey: {SB_KEY}", "-H", f"Authorization: Bearer {SB_KEY}"]
+    p = subprocess.run(cmd, capture_output=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"download failed: {p.stderr.decode()[:200]}")
 
 
 def upload(path, src_file, content_type="video/mp4"):
-    with open(src_file, "rb") as f:
-        data = f.read()
-    sb_req("POST", f"/storage/v1/object/{BUCKET}/{path}", data,
-           {"Content-Type": content_type, "x-upsert": "true"})
+    # Streamed from disk for the same reason as download().
+    cmd = ["curl", "-s", "-f", "-X", "POST",
+           f"{SB_URL}/storage/v1/object/{BUCKET}/{path}",
+           "-H", f"apikey: {SB_KEY}", "-H", f"Authorization: Bearer {SB_KEY}",
+           "-H", f"Content-Type: {content_type}", "-H", "x-upsert: true",
+           "--data-binary", f"@{src_file}"]
+    p = subprocess.run(cmd, capture_output=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"upload failed: {p.stderr.decode()[:200]}")
 
 
 def probe_duration(path):
@@ -178,7 +189,11 @@ def render(src, segments, dest, jid):
     parts = []
     n = len(segments)
     for i, (a, b) in enumerate(segments):
-        parts.append(f"[0:v]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS[v{i}]")
+        # Cap output at 1080x1920: cuts are made for social posting, and
+        # encoding a 4K source at full size is what OOM-killed the worker
+        # on 2026-10-25. force_original_aspect_ratio=decrease never
+        # upscales a smaller source.
+        parts.append(f"[0:v]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS,scale=w=1080:h=1920:force_original_aspect_ratio=decrease:force_divisible_by=2[v{i}]")
         parts.append(f"[0:a]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS[a{i}]")
     concat_in = "".join(f"[v{i}][a{i}]" for i in range(n))
     parts.append(f"{concat_in}concat=n={n}:v=1:a=1[cv][ca]")
@@ -277,7 +292,50 @@ def cleanup_expired():
         print(f"cleanup: media expired for job {row['id']}")
 
 
+STALE_MINUTES = 12
+MAX_ATTEMPTS = 3
+
+
+def reclaim_stale():
+    """Self-healing for worker deaths. If the worker process dies mid-job
+    (host restart, OOM kill), the job stays in an active status forever
+    because only queued jobs are ever claimed (this orphaned a real job
+    twice on 2026-10-25). Any active job whose row has not been touched in
+    STALE_MINUTES goes back in the queue; after MAX_ATTEMPTS reclamations
+    it is failed with a clear message instead of looping forever. Runs at
+    pass start, when this single worker is by definition between jobs, so
+    it can never steal a live job."""
+    from datetime import datetime, timedelta, timezone
+    from urllib.parse import quote
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=STALE_MINUTES)).isoformat()
+    rows = rest(
+        "GET",
+        "hookcut_jobs?status=in.(editing,rendering)&updated_at=lt."
+        + quote(cutoff, safe=":")
+        + "&select=id,attempts&limit=10",
+    )
+    if isinstance(rows, dict):
+        print(f"reclaim: unexpected response: {rows}")
+        return
+    for row in rows or []:
+        attempts = (row.get("attempts") or 0) + 1
+        if attempts >= MAX_ATTEMPTS:
+            rest("PATCH", f"hookcut_jobs?id=eq.{row['id']}", {
+                "status": "failed", "attempts": attempts, "stage": "error",
+                "error": ("This video could not be cut after several tries. "
+                          "Try exporting it at 1080p and upload it again."),
+                "finished_at": "now()"})
+            print(f"reclaim: job {row['id']} failed after {attempts} attempts")
+        else:
+            rest("PATCH", f"hookcut_jobs?id=eq.{row['id']}", {
+                "status": "queued", "attempts": attempts, "progress": 0,
+                "stage": "queued", "started_at": None})
+            print(f"reclaim: job {row['id']} requeued (attempt {attempts})")
+
+
 def main():
+    reclaim_stale()
     cleanup_expired()
     jobs = rest("GET", "hookcut_jobs?status=eq.queued&order=created_at.asc&limit=1")
     if not jobs:
