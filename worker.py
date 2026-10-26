@@ -203,7 +203,7 @@ def render(src, segments, dest, jid):
     cmd = ["ffmpeg", "-y", "-i", src, "-filter_complex", graph,
            "-map", "[cv]", "-map", "[outa]",
            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
-           "-preset", "fast", "-c:a", "aac", "-b:a", "160k",
+           "-preset", "fast", "-level:v", "4.2", "-c:a", "aac", "-b:a", "160k",
            "-movflags", "+faststart", "-t", f"{total:.3f}", dest]
     run_ffmpeg_progress(cmd, total, 30, 92, jid, "rendering")
 
